@@ -4,38 +4,32 @@
 use std::ffi::OsStr;
 use std::fs::File;
 use std::io::{self, Read};
-use std::path::Path;
 
-use compact_str::CompactStr;
+use bstr::{BStr, ByteSlice};
 
-pub fn exe_of_pid(pid: u32) -> Option<CompactStr> {
-    let mut itoa = itoa::Buffer::new();
-    let exe = concat_in_place::strcat!("/proc/" itoa.format(pid) "/exe");
-
-    if let Ok(exe) = std::fs::read_link(Path::new(&exe)) {
-        if let Some(exe) = exe.file_name().and_then(std::ffi::OsStr::to_str) {
-            if let Some(exe) = exe.split_ascii_whitespace().next() {
-                return Some(CompactStr::from(exe));
-            }
-        }
-    }
-
-    None
+pub struct Buffer {
+    pub path: String,
+    pub file: String,
+    pub file_raw: Vec<u8>,
+    pub itoa: itoa::Buffer,
 }
 
-pub fn name_of_pid(pid: u32) -> Option<CompactStr> {
-    let mut itoa = itoa::Buffer::new();
-    let path = concat_in_place::strcat!("/proc/" itoa.format(pid) "/status");
-
-    if let Ok(buffer) = std::fs::read_to_string(&path) {
-        if let Some(name) = buffer.lines().next() {
-            if let Some(name) = name.strip_prefix("Name:") {
-                return Some(CompactStr::from(name.trim()));
-            }
+impl Buffer {
+    pub fn new() -> Self {
+        Self {
+            path: String::with_capacity(256),
+            file: String::with_capacity(4096),
+            file_raw: Vec::with_capacity(4096),
+            itoa: itoa::Buffer::new(),
         }
     }
 
-    None
+    /// Shrinks buffers to a reasonable default
+    pub fn shrink(&mut self) {
+        self.path.shrink_to(512);
+        self.file.shrink_to(16384);
+        self.file_raw.shrink_to(16384);
+    }
 }
 
 pub fn read_into_string<P: AsRef<OsStr>>(buf: &mut String, path: P) -> io::Result<&str> {
@@ -43,4 +37,31 @@ pub fn read_into_string<P: AsRef<OsStr>>(buf: &mut String, path: P) -> io::Resul
     buf.clear();
     file.read_to_string(buf)?;
     Ok(&*buf)
+}
+
+pub fn read_into_vec<P: AsRef<OsStr>>(buf: &mut Vec<u8>, path: P) -> io::Result<&[u8]> {
+    let mut file = File::open(path.as_ref())?;
+    buf.clear();
+    file.read_to_end(buf)?;
+    Ok(&*buf)
+}
+
+pub fn file_key<'a>(buf: &'a mut Vec<u8>, path: &str, key: &str) -> Option<&'a [u8]> {
+    buf.clear();
+
+    let Ok(mut status) = crate::utils::read_into_vec(buf, path) else {
+        return None;
+    };
+
+    while let Some(pos) = memchr::memchr(b'\n', status) {
+        let line = BStr::new(&status[..pos]);
+
+        if let Some(ppid) = line.strip_prefix(key.as_bytes()) {
+            return Some(BStr::new(ppid).trim());
+        }
+
+        status = &status[pos + 1..];
+    }
+
+    None
 }

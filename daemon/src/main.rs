@@ -1,76 +1,127 @@
 // Copyright 2021-2022 System76 <info@system76.com>
 // SPDX-License-Identifier: MPL-2.0
 
-#[macro_use]
-extern crate const_format;
-#[macro_use]
-extern crate next_gen;
+#![deny(missing_docs)]
+
+//! System76 Scheduler
+
 #[macro_use]
 extern crate zbus;
 
-mod config;
-mod cpu;
+use qcell::LCellOwner;
+pub use system76_scheduler_config as config;
+use system76_scheduler_pipewire as scheduler_pipewire;
+
+mod cfs;
 mod dbus;
-mod nice;
-mod paths;
 mod priority;
+mod process;
+mod pw;
+mod service;
 mod utils;
 
-use crate::config::cpu::Config as CpuConfig;
-use crate::paths::SchedPaths;
 use clap::ArgMatches;
 use dbus::{CpuMode, Server};
-use std::{collections::HashMap, path::Path, time::Duration};
+use std::{
+    path::Path,
+    time::{Duration, Instant},
+};
 use tokio::sync::mpsc::Sender;
 use upower_dbus::UPowerProxy;
 use zbus::{Connection, PropertyStream};
 
+use crate::utils::Buffer;
+
 #[derive(Debug)]
 enum Event {
-    ExecCreate(execsnoop::Process),
+    ExecCreate(ExecCreate),
     OnBattery(bool),
+    Pipewire(scheduler_pipewire::ProcessEvent),
+    RefreshProcessMap,
     ReloadConfiguration,
     SetCpuMode,
     SetCustomCpuMode,
     SetForegroundProcess(u32),
-    UpdateProcessMap(HashMap<u32, Option<u32>>, Vec<u32>),
 }
 
-#[tokio::main(flavor = "current_thread")]
-async fn main() -> anyhow::Result<()> {
-    if std::env::var_os("RUST_LOG").is_none() {
-        std::env::set_var("RUST_LOG", "info");
-    }
+#[derive(Debug)]
+struct ExecCreate {
+    pid: u32,
+    parent_pid: u32,
+    name: String,
+    cmdline: String,
+}
 
-    tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
-        .with_writer(std::io::stderr)
-        .without_time()
-        .init();
+fn main() -> anyhow::Result<()> {
+    let mut result = Ok(());
 
-    let connection = Connection::system().await?;
+    LCellOwner::scope(|owner| {
+        pipewire::init();
 
-    let matches = clap::command!()
-        .propagate_version(true)
-        .subcommand_required(true)
-        .arg_required_else_help(true)
-        .subcommand(
-            clap::Command::new("cpu")
-                .about("select a CFS scheduler profile")
-                .arg(clap::arg!([PROFILE])),
-        )
-        .subcommand(
-            clap::Command::new("daemon")
-                .about("launch the system daemon")
-                .subcommand(clap::Command::new("reload").about("reload system configuration")),
-        )
-        .get_matches();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
 
-    match matches.subcommand() {
-        Some(("cpu", matches)) => cpu(connection, matches).await,
-        Some(("daemon", matches)) => daemon(connection, matches).await,
-        _ => Ok(()),
-    }
+        let main = async {
+            let future = async {
+                if std::env::var_os("RUST_LOG").is_none() {
+                    std::env::set_var("RUST_LOG", "info");
+                }
+
+                tracing_subscriber::fmt()
+                    .pretty()
+                    .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+                    .with_writer(std::io::stderr)
+                    .without_time()
+                    .with_line_number(false)
+                    .with_file(false)
+                    .with_target(false)
+                    .init();
+
+                let connection = Connection::system().await?;
+
+                let matches = clap::command!()
+                    .propagate_version(true)
+                    .subcommand_required(true)
+                    .arg_required_else_help(true)
+                    .subcommand(
+                        clap::Command::new("cpu")
+                            .about("select a CFS scheduler profile")
+                            .arg(clap::arg!([PROFILE])),
+                    )
+                    .subcommand(
+                        clap::Command::new("daemon")
+                            .about("launch the system daemon")
+                            .subcommand(
+                                clap::Command::new("reload").about("reload system configuration"),
+                            ),
+                    )
+                    .subcommand(
+                        clap::Command::new("pipewire")
+                            .about("monitor pipewire process ID activities"),
+                    )
+                    .get_matches();
+
+                match matches.subcommand() {
+                    Some(("cpu", matches)) => cpu(connection, matches).await,
+                    Some(("daemon", matches)) => daemon(connection, matches, owner).await,
+                    Some(("pipewire", _matches)) => pw::main().await,
+                    _ => Ok(()),
+                }
+            };
+
+            result = tokio::task::LocalSet::new().run_until(future).await;
+
+            unsafe {
+                pipewire::deinit();
+            }
+        };
+
+        runtime.block_on(main);
+    });
+
+    result
 }
 
 async fn reload(connection: Connection) -> anyhow::Result<()> {
@@ -85,7 +136,7 @@ async fn reload(connection: Connection) -> anyhow::Result<()> {
 async fn cpu(connection: Connection, args: &ArgMatches) -> anyhow::Result<()> {
     let mut connection = dbus::ClientProxy::new(&connection).await?;
 
-    match args.value_of("PROFILE").as_ref() {
+    match args.get_one::<&str>("PROFILE") {
         Some(profile) => {
             connection.set_cpu_profile(profile).await?;
         }
@@ -98,19 +149,68 @@ async fn cpu(connection: Connection, args: &ArgMatches) -> anyhow::Result<()> {
 }
 
 #[allow(clippy::too_many_lines)]
-async fn daemon(connection: Connection, args: &ArgMatches) -> anyhow::Result<()> {
-    match args.subcommand() {
-        Some(("reload", _)) => return reload(connection).await,
-        _ => (),
+async fn daemon(
+    connection: Connection,
+    args: &ArgMatches,
+    owner: LCellOwner<'_>,
+) -> anyhow::Result<()> {
+    let mut buffer = Buffer::new();
+
+    if let Some(("reload", _)) = args.subcommand() {
+        return reload(connection).await;
     }
 
-    tracing::info!("starting daemon service");
-
-    let paths = SchedPaths::new()?;
-
-    let upower_proxy = UPowerProxy::new(&connection).await?;
+    let service = &mut service::Service::new(owner);
+    service.reload_configuration();
 
     let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+
+    let upower = UPowerProxy::new(&connection).await?;
+
+    // Spawns an async task that watches for battery status notifications.
+    tokio::task::spawn_local(battery_monitor(
+        upower.receive_on_battery_changed().await,
+        tx.clone(),
+    ));
+
+    // Controls the kernel's sched_autogroup setting.
+    autogroup_set(service.config.autogroup_enabled);
+
+    // Tweaks CFS parameters based on battery status.
+    if service.config.cfs_profiles.enable {
+        service.cfs_on_battery(upower.on_battery().await.unwrap_or(false));
+    }
+
+    // If enabled, monitors processes and applies priorities to them.
+    if service.config.process_scheduler.enable {
+        // Schedules process updates
+        tokio::task::spawn_local({
+            let refresh_rate =
+                Duration::from_secs(u64::from(service.config.process_scheduler.refresh_rate));
+            let tx = tx.clone();
+            async move {
+                let _res = tx.send(Event::RefreshProcessMap).await;
+                tokio::time::sleep(refresh_rate).await;
+            }
+        });
+
+        // Use execsnoop-bpfcc to watch for new processes being created.
+        if service.config.process_scheduler.execsnoop {
+            if Path::new(execsnoop::EXECSNOOP_PATH).exists() {
+                integrate_execsnoop(tx.clone());
+            } else {
+                tracing::warn!(
+                    "install {} to monitor processes in realtime",
+                    execsnoop::EXECSNOOP_PATH
+                );
+            }
+        }
+
+        // Monitors pipewire-connected processes.
+        if service.config.process_scheduler.pipewire.is_some() {
+            tokio::task::spawn_local(pw::monitor(tx.clone()));
+        }
+    }
 
     connection
         .object_server()
@@ -126,111 +226,101 @@ async fn daemon(connection: Connection, args: &ArgMatches) -> anyhow::Result<()>
 
     connection.request_name("com.system76.Scheduler").await?;
 
-    // Spawns an async task that watches for battery status notifications.
-    tokio::spawn(battery_monitor(
-        upower_proxy.receive_on_battery_changed().await,
-        tx.clone(),
-    ));
-
-    // Spawns a process monitor that updates process map info.
-    tokio::spawn(process_monitor(tx.clone()));
-
-    // Use execsnoop-bpfcc to watch for new processes being created.
-    if let Ok(watcher) = execsnoop::watch() {
-        let handle = tokio::runtime::Handle::current();
-        let tx = tx.clone();
-        std::thread::spawn(move || {
-            handle.block_on(async move {
-                for process in watcher {
-                    let _res = tx.send(Event::ExecCreate(process)).await;
-                }
-            });
-        });
+    // Start service after system uptime is above 10 seconds
+    if let Some(uptime) = uptime() {
+        if uptime < 10 {
+            std::thread::sleep(std::time::Duration::from_secs(10 - uptime));
+        }
     }
 
-    let apply_config = |on_battery: bool| {
-        cpu::tweak(
-            &paths,
-            &if on_battery {
-                tracing::debug!("auto config applying default config");
-                CpuConfig::default_config()
-            } else {
-                tracing::debug!("auto config applying responsive config");
-                CpuConfig::responsive_config()
-            },
-        );
-    };
-
-    apply_config(upower_proxy.on_battery().await.unwrap_or(false));
-
-    let mut priority_service = priority::Service::default();
-    priority_service.reload_configuration();
-
     while let Some(event) = rx.recv().await {
-        let interface_result = connection
-            .object_server()
-            .interface::<_, Server>("/com/system76/Scheduler")
-            .await;
-
-        let iface_handle = match interface_result {
-            Ok(iface_handler) => iface_handler,
-            Err(why) => {
-                tracing::error!("DBus interface not reachable: {:#?}", why);
-                break;
-            }
-        };
-
-        let interface = iface_handle.get().await;
-
         match event {
-            Event::ExecCreate(execsnoop::Process {
-                parent_pid, pid, ..
+            Event::ExecCreate(ExecCreate {
+                pid,
+                parent_pid,
+                name,
+                cmdline,
             }) => {
-                priority_service.assign_new_process(pid, parent_pid);
+                service.assign_new_process(&mut buffer, pid, parent_pid, name, cmdline);
+                service.assign_children(&mut buffer, pid);
+                service.garbage_clean(&mut buffer);
             }
 
-            Event::UpdateProcessMap(map, background_processes) => {
-                priority_service.update_process_map(map, background_processes);
+            Event::RefreshProcessMap => {
+                service.process_map_refresh(&mut buffer);
             }
 
             Event::SetForegroundProcess(pid) => {
-                priority_service.set_foreground_process(pid);
+                tracing::debug!("setting {pid} as foreground process");
+                service.set_foreground_process(&mut buffer, pid);
+                service.garbage_clean(&mut buffer);
+            }
+
+            Event::Pipewire(scheduler_pipewire::ProcessEvent::Add(process)) => {
+                service.set_pipewire_process(&mut buffer, process);
+                service.garbage_clean(&mut buffer);
+            }
+
+            Event::Pipewire(scheduler_pipewire::ProcessEvent::Remove(process)) => {
+                service.remove_pipewire_process(&mut buffer, process);
             }
 
             Event::OnBattery(on_battery) => {
+                let Some(handle) = dbus::interface_handle(&connection).await else {
+                    break;
+                };
+
+                let interface = handle.get().await;
+
                 if let CpuMode::Auto = interface.cpu_mode {
-                    apply_config(on_battery);
+                    service.cfs_on_battery(on_battery);
                 }
             }
 
-            Event::SetCpuMode => match interface.cpu_mode {
-                CpuMode::Auto => {
-                    tracing::debug!("applying auto config");
-                    apply_config(upower_proxy.on_battery().await.unwrap_or(false));
-                }
+            Event::SetCpuMode => {
+                let Some(handle) = dbus::interface_handle(&connection).await else {
+                    break;
+                };
 
-                CpuMode::Default => {
-                    tracing::debug!("applying default config");
-                    cpu::tweak(&paths, &CpuConfig::default_config());
-                }
+                let interface = handle.get().await;
 
-                CpuMode::Responsive => {
-                    tracing::debug!("applying responsive config");
-                    cpu::tweak(&paths, &CpuConfig::responsive_config());
-                }
+                match interface.cpu_mode {
+                    CpuMode::Auto => {
+                        tracing::debug!("applying auto config");
+                        service.cfs_on_battery(upower.on_battery().await.unwrap_or(false));
+                    }
 
-                CpuMode::Custom => (),
-            },
+                    CpuMode::Default => {
+                        tracing::debug!("applying default config");
+                        service.cfs_apply(service.cfs_default_config());
+                    }
+
+                    CpuMode::Responsive => {
+                        tracing::debug!("applying responsive config");
+                        service.cfs_apply(service.cfs_responsive_config());
+                    }
+
+                    CpuMode::Custom => (),
+                }
+            }
 
             Event::SetCustomCpuMode => {
-                if let Some(config) = CpuConfig::custom_config(&interface.cpu_profile) {
+                let Some(handle) = dbus::interface_handle(&connection).await else {
+                    break;
+                };
+
+                let interface = handle.get().await;
+
+                if let Some(profile) = service.cfs_config(&interface.cpu_profile) {
                     tracing::debug!("applying {} config", interface.cpu_profile);
-                    cpu::tweak(&paths, &config);
+                    service.cfs_apply(profile);
                 }
             }
 
             Event::ReloadConfiguration => {
-                priority_service.reload_configuration();
+                tracing::debug!("reloading configuration");
+                service.reload_configuration();
+                autogroup_set(service.config.autogroup_enabled);
             }
         }
     }
@@ -239,6 +329,8 @@ async fn daemon(connection: Connection, args: &ArgMatches) -> anyhow::Result<()>
 
 async fn battery_monitor(mut events: PropertyStream<'_, bool>, tx: Sender<Event>) {
     use futures::StreamExt;
+
+    tracing::debug!("monitoring udev for battery hotplug events");
     while let Some(event) = events.next().await {
         if let Ok(on_battery) = event.get().await {
             let _res = tx.send(Event::OnBattery(on_battery)).await;
@@ -246,64 +338,59 @@ async fn battery_monitor(mut events: PropertyStream<'_, bool>, tx: Sender<Event>
     }
 }
 
-async fn process_monitor(tx: Sender<Event>) {
-    let mut file_buf = String::with_capacity(2048);
+fn autogroup_set(enable: bool) {
+    const PATH: &str = "/proc/sys/kernel/sched_autogroup_enabled";
+    let _res = std::fs::write(PATH, if enable { b"1" } else { b"0" });
+}
 
-    let mut background_processes = Vec::with_capacity(256);
-    let mut parents = HashMap::<u32, Option<u32>>::with_capacity(256);
+/// Listens to exec events from the kernel to get process IDs in realtime.
+fn integrate_execsnoop(tx: Sender<Event>) {
+    tracing::info!("monitoring process IDs in realtime with execsnoop");
+    let (scheduled_tx, mut scheduled_rx) = tokio::sync::mpsc::unbounded_channel();
+    std::thread::spawn(move || {
+        match execsnoop::watch() {
+            Ok(mut watcher) => {
+                // Listen for spawned process, scheduling them to be handled with a delay of 1 second after creation.
+                // The delay is to ensure that a process has been added to a cgroup
+                while let Some(process) = watcher.next() {
+                    let Ok(cmdline) = std::str::from_utf8(process.cmd) else {
+                        continue
+                    };
 
-    loop {
-        if let Ok(procfs) = Path::new("/proc").read_dir() {
-            background_processes.clear();
-            parents.clear();
+                    let name = process::name(cmdline);
 
-            for proc_entry in procfs.filter_map(Result::ok) {
-                let proc_path = proc_entry.path();
-
-                let pid = if let Some(pid) = proc_path
-                    .file_name()
-                    .and_then(std::ffi::OsStr::to_str)
-                    .and_then(|p| p.parse::<u32>().ok())
-                {
-                    pid
-                } else {
-                    continue;
-                };
-
-                let mut parent = None;
-
-                let status = proc_path.join("status");
-
-                if let Ok(status) = crate::utils::read_into_string(&mut file_buf, &*status) {
-                    for line in status.lines() {
-                        if let Some(ppid) = line.strip_prefix("PPid:") {
-                            if let Ok(ppid) = ppid.trim().parse::<u32>() {
-                                parent = Some(ppid);
-                            }
-
-                            break;
-                        }
-                    }
-                }
-
-                parents.insert(pid, parent);
-
-                // Prevents kernel processes from having their priorities changed.
-                if let Ok(exe) = std::fs::read_link(proc_path.join("exe")) {
-                    if exe.file_name().is_some() {
-                        background_processes.push(pid);
-                    }
+                    tracing::debug!(
+                        "{:?} created by {:?} ({name})",
+                        process.pid,
+                        process.parent_pid
+                    );
+                    let _res = scheduled_tx.send((
+                        Instant::now() + Duration::from_secs(2),
+                        ExecCreate {
+                            pid: process.pid,
+                            parent_pid: process.parent_pid,
+                            name: name.to_owned(),
+                            cmdline: cmdline.to_owned(),
+                        },
+                    ));
                 }
             }
-
-            let _res = tx
-                .send(Event::UpdateProcessMap(
-                    parents.clone(),
-                    background_processes.clone(),
-                ))
-                .await;
+            Err(error) => {
+                tracing::error!("failed to start execsnoop: {error}");
+            }
         }
+    });
 
-        tokio::time::sleep(Duration::from_secs(60)).await;
-    }
+    tokio::task::spawn_local(async move {
+        while let Some((delay, process)) = scheduled_rx.recv().await {
+            tokio::time::sleep_until(delay.into()).await;
+            let _res = tx.send(Event::ExecCreate(process)).await;
+        }
+    });
+}
+
+fn uptime() -> Option<u64> {
+    let uptime = std::fs::read_to_string("/proc/uptime").ok()?;
+    let seconds = uptime.split('.').next()?;
+    seconds.parse::<u64>().ok()
 }
