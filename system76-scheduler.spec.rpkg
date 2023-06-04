@@ -1,6 +1,6 @@
 Name:           system76-scheduler
-Version:        1.2.1
-Release:        1%{?dist}
+Version:        2.0.1
+Release:        2%{?dist}
 Summary:        System76 Scheduler daemon
 
 License:        MPLv2.0
@@ -12,7 +12,9 @@ Source:        	{{{ git_dir_pack }}}
 BuildRequires: rust
 BuildRequires: cargo
 BuildRequires: just
-BuildRequires: systemd-rpm-macros  
+BuildRequires: systemd-rpm-macros
+
+Requires: bcc-tools
 
 %description
 Auto-configure CFS and process priorities for improved desktop responsiveness 
@@ -47,14 +49,17 @@ just rootdir=%{buildroot} install
 # are going to be installed into target system where the rpm is installed.
 %files
 %{_bindir}/system76-scheduler
-%{_sysconfdir}/system76-scheduler/config.ron
-%{_sysconfdir}/system76-scheduler/assignments/default.ron
-%{_sysconfdir}/system76-scheduler/assignments/rhel.ron
-%{_sysconfdir}/system76-scheduler/exceptions/default.ron
+%{_sysconfdir}/system76-scheduler/config.kdl
+%{_sysconfdir}/system76-scheduler/process-scheduler/pop_os.kdl
+%{_sysconfdir}/system76-scheduler/process-scheduler/rhel.kdl
 %{_unitdir}/com.system76.Scheduler.service
 %{_sysconfdir}/dbus-1/system.d/com.system76.Scheduler.conf
 
 %changelog
+* Thu June 8 2023 Matthew Jakeman <mattjakemandev@gmail.com>
+- Update to major release 2.0.1
+- Use KDL format for RHEL specific configuration
+
 * Fri May 27 2022 Matthew Jakeman <mjakeman26@outlook.co.nz>
 - Update to major release 1.2.1
 - Rewrite spec file to use tagged release

@@ -1,0 +1,7 @@
+assignments {
+	package-manager {
+    dnf
+    rpm
+    yum
+  }
+}

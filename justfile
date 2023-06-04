@@ -56,6 +56,7 @@ install:
     mkdir -p {{confdir}}/system76-scheduler/process-scheduler
     install -Dm0644 data/config.kdl {{confdir}}/system76-scheduler/config.kdl
     install -Dm0644 data/pop_os.kdl {{confdir}}/system76-scheduler/process-scheduler/pop_os.kdl
+    install -Dm0644 data/rhel.kdl {{confdir}}/system76-scheduler/process-scheduler/rhel.kdl
     install -Dm0755 target/release/{{binary}} {{target-bin}}
     install -Dm0644 data/{{id}}.service {{libdir}}/systemd/system/{{id}}.service
     install -Dm0644 data/{{id}}.conf {{confdir}}/dbus-1/system.d/{{id}}.conf
