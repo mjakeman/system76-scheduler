@@ -49,6 +49,7 @@ just rootdir=%{buildroot} install
 %{_bindir}/system76-scheduler
 %{_sysconfdir}/system76-scheduler/config.ron
 %{_sysconfdir}/system76-scheduler/assignments/default.ron
+%{_sysconfdir}/system76-scheduler/assignments/rhel.ron
 %{_sysconfdir}/system76-scheduler/exceptions/default.ron
 %{_unitdir}/com.system76.Scheduler.service
 %{_sysconfdir}/dbus-1/system.d/com.system76.Scheduler.conf
